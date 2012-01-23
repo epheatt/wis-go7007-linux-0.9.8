@@ -1,0 +1,222 @@
+--- wis-go7007-linux-0.9.4/apps/gorecord.c.orig	2005-03-21 06:42:57.000000000 +0200
++++ wis-go7007-linux-0.9.4/apps/gorecord.c	2005-05-27 09:59:05.000000000 +0300
+@@ -18,6 +18,9 @@
+  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++/* May 27, 2005 
++ * A-V Sync by Timo Pylvanainen, tpyl+nosa at iki <dot> fi  */
++
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <limits.h>
+@@ -33,9 +36,11 @@
+ #include <linux/videodev.h>
+ #include <linux/soundcard.h>
+ #include <errno.h>
++#include <math.h>
+ 
+ #include "../include/go7007.h"
+ 
++
+ /* Note: little-endian */
+ #define PUT_16(p,v) ((p)[0]=(v)&0xff,(p)[1]=((v)>>8)&0xff)
+ #define PUT_32(p,v) ((p)[0]=(v)&0xff,(p)[1]=((v)>>8)&0xff,(p)[2]=((v)>>16)&0xff,(p)[3]=((v)>>24)&0xff)
+@@ -46,6 +51,8 @@
+ #define MAX_BUFFERS	32
+ #define AUDIO_BUF_LEN	(256*1024)
+ 
++#define MIN_SYNC_STEP 16
++
+ /* Defined in tv-freq.c */
+ int chan_to_freq(char *name);
+ 
+@@ -55,12 +62,16 @@
+ int buf_count = 0;
+ int avi_frame_count = 0;
+ int total_frames = 0;
++int total_av_corr = 0;
++double av_offset = 0;
++double fps=29.97;
+ int duration = -1;
+ unsigned int sequence;
+ int frame_limit = -1;
+ int max_frame_length = 0;
+ unsigned int vbytes = 0, abytes = 0;
+ unsigned char audio_buffer[AUDIO_BUF_LEN];
++unsigned char audio_sync_buffer[AUDIO_BUF_LEN];
+ int audio_len = 0;
+ int nowrite = 0;
+ int probe = 0;
+@@ -348,6 +359,13 @@
+ 						"secam-l, ntsc-j\n");
+ 				exit(1);
+ 			}
++			if(std == V4L2_STD_NTSC_M_JP ||
++			   std ==  V4L2_STD_NTSC_M ) {
++				fps = 29.97;
++			} else {
++				fps = 25.0;
++			}
++
+ 		} else if (!strcmp(argv[i], "-tvchan")) {
+ 			tv_freq = chan_to_freq(argv[++i]);
+ 			if (tv_freq < 0)
+@@ -811,10 +829,95 @@
+ 	}
+ 	if (interrupted) return 0;
+ 	audio_len += ret;
+-	abytes += ret;
+ 	return ret;
+ }
+ 
++void average16b(unsigned char* dst, unsigned char* src1, unsigned char* src2)
++{
++	int16_t a,b,c;
++	
++	a = (((u_int16_t)*(src1+1)) << 8) | (u_int16_t)*(src1);
++	b = (((u_int16_t)*(src2+1)) << 8) | (u_int16_t)*(src2);
++
++	c = a/2+b/2 + (a&b&0x1);
++	*dst = ((u_int16_t)c)&0xFF;
++	*(dst+1) = (((u_int16_t)c)>>8)&0xFF;
++}
++	
++
++int audio_video_sync(void)
++{
++	int i=0;
++	int j=0;
++	int k=0;
++	static int sync_step=0;
++	
++	
++	while(i<audio_len && j < AUDIO_BUF_LEN) {
++		/* If av_offset more than about 50ms and sync_step reached */
++		if(fabs(av_offset) > 4000 && 
++		   sync_step > (int)(192000.0/fabs(av_offset)) && sync_step > MIN_SYNC_STEP ) {
++			/* If audio lagging, i.e. too many audio bytes, and
++			 * enough audio_buffer left to average samples then do that */
++			if(av_offset < 0 && i < audio_len-4) {
++				/* Merge two samples into one */
++				for(k=0;k<2;k++) {
++					average16b(&audio_sync_buffer[j], &audio_buffer[i], &audio_buffer[i+4]);
++					i+=2;
++					j+=2;
++				}
++				i+=4;
++				/* Offset now reduced by 4 bytes */
++				av_offset += 4;
++				total_av_corr -= 4;
++				/* Correction performed */
++				sync_step = 0;
++			} else if(av_offset > 0 && j < AUDIO_BUF_LEN-4) {
++				/* Audio running, i.e. too few audio bytes, then insert
++				 * samples */
++				
++				for(k=0;k<2;k++) {
++					/* Copy first words */
++					audio_sync_buffer[j] = audio_buffer[i];
++					audio_sync_buffer[j+1] = audio_buffer[i+1];
++					
++					/* Create second words */
++					average16b(&audio_sync_buffer[j+4], &audio_buffer[i], &audio_buffer[i+4]); 
++					i+=2;
++					j+=2;
++				}
++				j+=4;
++				/* Four bytes added */
++				av_offset -= 4;
++				total_av_corr += 4;
++				/* Correction performed */
++				sync_step = 0;
++			} else { /* To make sure something is always done */
++				for(k=0;k<4&&i<audio_len;k++) {
++					audio_sync_buffer[j] = audio_buffer[i];
++					j++;
++					i++;
++				}
++			}
++		} else {
++			/* No sync correction, move forward in both buffers */
++			for(k=0;k<4&&i<audio_len;k++) {
++				audio_sync_buffer[j] = audio_buffer[i];
++				j++;
++				i++;
++			}
++		}
++		sync_step++;
++		if(interrupted) {
++			return 0;
++		}
++	}
++	return j;
++}
++		
++		
++	
++
+ int v4l2_frame_capture(struct timeval *capture_time)
+ {
+ 	struct v4l2_buffer buf;
+@@ -843,7 +946,13 @@
+ 	if (audfd >= 0) {
+ 		alsa_read();
+ 		if (interrupted) return 0;
+-		write_frame(audio_buffer, audio_len, FOURCC("01wb"), 1);
++		/* Must be careful to update av_offset before 
++		 * calling audio_video_sync */
++		av_offset -= (double)audio_len;
++		audio_len = audio_video_sync();
++		if(interrupted) return 0;
++		write_frame(audio_sync_buffer, audio_len, FOURCC("01wb"), 1);
++		abytes += audio_len;
+ 		audio_len = 0;
+ 	}
+ 
+@@ -1009,8 +1118,10 @@
+ 			abytes, "uncompressed PCM");
+ 	fprintf(stderr, "    AVI file format overhead  : %d bytes\n",
+ 			filelen - vbytes - abytes);
+-	fprintf(stderr, "    Total file size           : %d bytes\n\n",
++	fprintf(stderr, "    Total file size           : %d bytes\n",
+ 			filelen);
++	fprintf(stderr, "    Total A/V correction      : %d bytes\n\n",
++			total_av_corr );
+ }
+ 
+ void interrupt_handler(int signal)
+@@ -1053,6 +1164,9 @@
+ 		return 0;
+ 	}
+ 	v4l2_start();
++	/* This will set the audiosync to be in line with the initial sync */
++	av_offset += 192000.0*2.0/fps;
++	
+ 	for (;;) {
+ 		/* Retrieve a new video frame and audio frame */
+ 		vframe_len = v4l2_frame_capture(&cur);
+@@ -1066,14 +1180,15 @@
+ 		else
+ 			filesize = lseek(avifd, 0, SEEK_CUR);
+ 		++avi_frame_count;
++		av_offset += 192000.0/fps;
+ 		if (total_frames++ == 0)
+ 			mmark = start = cur;
+ 		csec = 100 * (cur.tv_sec - start.tv_sec) +
+ 			(cur.tv_usec - start.tv_usec) / 10000;
+ 		fprintf(stderr,
+ 			"\r %02d:%02d.%02d  Frames: %5d  "
+-			"AVI size: %9d", csec / 6000, csec / 100 % 60,
+-			csec % 100, total_frames, filesize);
++			"AVI size: %9d  A-V: %7.2fms", csec / 6000, csec / 100 % 60,
++			csec % 100, total_frames, filesize, -av_offset/192);
+ 
+ 		/* Calculate and display video bitrate */
+ 		if (mcount++ == 50) {
+@@ -1122,4 +1237,4 @@
+ 	if (avifd >= 0)
+ 		avi_finish();
+ 	return 0;
+-};
++}
